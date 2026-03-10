@@ -224,10 +224,11 @@ def main():
     telethon_client = TelegramClient('bot_session', API_ID, API_HASH)
     analyzer_bot = VideoAnalyzerBot(telethon_client)
     
-    # Запускаем Telethon
+    # Запускаем Telethon КАК БОТА
     async def start_telethon():
-        await telethon_client.start()
-        logger.info("✅ Telethon клиент подключен")
+        # ВАЖНО: Используем бота, а не пользователя!
+        await telethon_client.start(bot_token=TELEGRAM_BOT_TOKEN)
+        logger.info("✅ Telethon клиент подключен как бот")
     
     loop.run_until_complete(start_telethon())
     
