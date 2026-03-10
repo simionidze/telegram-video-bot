@@ -1,13 +1,13 @@
 import os
 import asyncio
 import logging
-from flask import Flask, request
+import threading
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telethon import TelegramClient
 from telethon.tl.types import MessageMediaDocument
 from datetime import datetime
-import threading
 
 # Настройка логирования
 logging.basicConfig(
@@ -188,9 +188,8 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Команда /analyze от пользователя {update.effective_user.id}")
     
     try:
-        # Проверяем, указано ли количество постов
         if context.args and context.args[0].isdigit():
-            count = min(int(context.args[0]), 20)  # Максимум 20 постов
+            count = min(int(context.args[0]), 20)
             await update.message.reply_text(f"🔍 Анализирую {count} последних записей...")
             results = await analyzer_bot.analyze_channel(count)
         else:
@@ -205,7 +204,7 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка в команде analyze: {e}")
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
-# Flask маршруты для проверки активности
+# Flask маршруты
 @app.route('/')
 def home():
     return "Bot is running! 🤖"
@@ -215,8 +214,12 @@ def health():
     return "OK", 200
 
 def run_bot():
-    """Запуск бота в отдельном потоке"""
+    """Запуск бота с правильным event loop"""
     try:
+        # Создаем новый event loop для потока
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
         # Создаем приложение бота
         application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         
@@ -227,33 +230,33 @@ def run_bot():
         
         logger.info("🚀 Бот запущен и готов к работе")
         
-        # Запускаем бота (polling)
+        # Запускаем бота
         application.run_polling(allowed_updates=Update.ALL_TYPES)
     except Exception as e:
         logger.error(f"Ошибка при запуске бота: {e}")
+    finally:
+        loop.close()
 
-@app.before_first_request
-def before_first_request():
-    """Действия перед первым запросом"""
-    logger.info("🔥 Flask приложение запущено, инициализирую бота...")
-    
-    # Запускаем бота в фоне
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-    
-    # Подключаем Telethon в главном потоке
+def init_telethon():
+    """Инициализация Telethon в правильном event loop"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
-    async def init_telethon():
+    async def start_telethon():
         await telethon_client.start()
         logger.info("✅ Telethon клиент подключен")
     
-    loop.run_until_complete(init_telethon())
+    loop.run_until_complete(start_telethon())
+    return loop
 
 if __name__ == "__main__":
-    # Получаем порт из переменных окружения
-    port = int(os.environ.get('PORT', 5000))
+    # Сначала инициализируем Telethon
+    telethon_loop = init_telethon()
+    
+    # Запускаем бота в отдельном потоке
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
     
     # Запускаем Flask
+    port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
