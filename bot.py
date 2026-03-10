@@ -7,7 +7,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telethon import TelegramClient
 from telethon.tl.types import MessageMediaDocument
-from datetime import datetime
+from datetime import datetime, timedelta
+import pytz
 
 # Настройка логирования
 logging.basicConfig(
@@ -20,7 +21,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 API_ID = int(os.environ.get('API_ID', 0))
 API_HASH = os.environ.get('API_HASH')
-CHANNEL_USERNAME = os.environ.get('CHANNEL_USERNAME')
+CHANNEL_USERNAME = 'practika_video'  # Жестко задаем имя канала
 
 # Flask приложение для поддержания активности
 app = Flask(__name__)
@@ -32,41 +33,49 @@ analyzer_bot = None
 class VideoAnalyzerBot:
     def __init__(self, client):
         self.client = client
-        self.stats_cache = {}
         self.last_analysis = None
         logger.info("🤖 Бот инициализирован")
     
-    async def analyze_channel(self, posts_count=5):
-        """Анализ канала"""
+    async def analyze_last_5_days(self):
+        """Анализ записей за последние 5 дней"""
         try:
-            logger.info(f"🔍 Начинаю анализ {posts_count} последних записей...")
+            # Получаем текущее время и время 5 дней назад
+            now = datetime.now(pytz.UTC)
+            five_days_ago = now - timedelta(days=5)
+            
+            logger.info(f"🔍 Анализирую записи с {five_days_ago.strftime('%d.%m.%y')} по {now.strftime('%d.%m.%y')}")
             
             # Проверяем подключение Telethon
             if not self.client.is_connected():
                 await self.client.connect()
             
-            channel = await self.client.get_entity(CHANNEL_USERNAME)
+            # Получаем канал
+            channel = await self.client.get_entity('@' + CHANNEL_USERNAME)
             logger.info(f"📢 Канал найден: {channel.title}")
             
-            # Получаем последние сообщения
+            # Получаем все сообщения за последние 5 дней
             messages = []
-            async for message in self.client.iter_messages(channel, limit=posts_count):
-                messages.append(message)
+            async for message in self.client.iter_messages(channel, offset_date=now, reverse=False):
+                if message.date < five_days_ago:
+                    break
+                if message.date >= five_days_ago:
+                    messages.append(message)
             
-            logger.info(f"📊 Найдено записей: {len(messages)}")
+            logger.info(f"📊 Найдено записей за период: {len(messages)}")
             
             results = {
-                'total_videos': 0,
-                'posts': [],
-                'analyzed_at': datetime.now().strftime('%d.%m.%Y %H:%M:%S'),
-                'channel_title': channel.title
+                'analyzed_at': now.strftime('%d.%m.%Y %H:%M:%S'),
+                'channel_title': channel.title,
+                'period_start': five_days_ago.strftime('%d.%m.%y'),
+                'period_end': now.strftime('%d.%m.%y'),
+                'posts': []
             }
             
+            # Анализируем каждое сообщение (пост)
             for message in messages:
                 post_info = {
-                    'post_id': message.id,
-                    'post_date': message.date.strftime('%d.%m.%Y %H:%M'),
-                    'post_text': message.text[:100] if message.text else "Без текста",
+                    'date': message.date.strftime('%d.%m.%y'),
+                    'post_title': self.extract_post_title(message),
                     'video_count': 0,
                     'videos': []
                 }
@@ -75,7 +84,7 @@ class VideoAnalyzerBot:
                     # Получаем комментарии к посту
                     comments = await self.client.get_messages(
                         channel,
-                        limit=100,
+                        limit=500,  # Увеличиваем лимит для видео
                         reply_to=message.id
                     )
                     
@@ -89,49 +98,59 @@ class VideoAnalyzerBot:
                                         'size': comment.document.size / (1024*1024) if comment.document.size else 0
                                     })
                     
-                    results['total_videos'] += post_info['video_count']
                     results['posts'].append(post_info)
-                    logger.info(f"📝 Пост #{message.id}: найдено {post_info['video_count']} видео")
+                    logger.info(f"📝 Пост от {post_info['date']}: '{post_info['post_title']}' - {post_info['video_count']} видео")
                     
                 except Exception as e:
                     logger.error(f"Ошибка при анализе комментариев к посту {message.id}: {e}")
+                    post_info['video_count'] = 0
+                    results['posts'].append(post_info)
             
-            # Сохраняем в кэш
-            cache_key = f"analysis_{posts_count}"
-            self.stats_cache[cache_key] = results
+            # Сортируем посты по дате (от новых к старым)
+            results['posts'].sort(key=lambda x: x['date'], reverse=True)
             self.last_analysis = results
             
-            logger.info(f"✅ Анализ завершен. Всего видео: {results['total_videos']}")
+            logger.info(f"✅ Анализ завершен. Всего постов: {len(results['posts'])}")
             return results
             
         except Exception as e:
             logger.error(f"❌ Ошибка анализа: {e}")
             return {'error': str(e)}
     
+    def extract_post_title(self, message):
+        """Извлекает название поста из текста сообщения"""
+        if message.text:
+            # Берем первую строку или первые 50 символов
+            first_line = message.text.split('\n')[0]
+            if len(first_line) > 50:
+                return first_line[:50] + "..."
+            return first_line if first_line else "Без названия"
+        return "Без названия"
+    
     def format_results(self, results):
         """Форматирование результатов для отправки"""
         if 'error' in results:
             return f"❌ Ошибка: {results['error']}"
         
+        if not results['posts']:
+            return f"📊 За период {results['period_start']} - {results['period_end']} постов не найдено."
+        
         text = f"📊 **Анализ канала {results['channel_title']}**\n"
-        text += f"🕐 Выполнен: {results['analyzed_at']}\n"
-        text += f"📹 **Всего видео: {results['total_videos']}**\n\n"
+        text += f"📅 Период: {results['period_start']} - {results['period_end']}\n"
+        text += f"🕐 Анализ выполнен: {results['analyzed_at']}\n\n"
         
-        text += "📋 **Последние записи:**\n"
-        text += "─" * 30 + "\n"
+        text += "📋 **Найденные записи:**\n"
+        text += "─" * 40 + "\n"
         
-        for i, post in enumerate(results['posts'], 1):
-            text += f"\n{i}. **Пост #{post['post_id']}**\n"
-            text += f"   📅 {post['post_date']}\n"
-            text += f"   🎥 Видео: {post['video_count']}\n"
-            
-            if post['video_count'] > 0:
-                total_size = sum(v['size'] for v in post['videos'])
-                text += f"   💾 Объем: {total_size:.1f} МБ\n"
-            
-            if post['post_text'] and post['post_text'] != "Без текста":
-                short_text = post['post_text'][:50] + "..." if len(post['post_text']) > 50 else post['post_text']
-                text += f"   📝 {short_text}\n"
+        for post in results['posts']:
+            text += f"\n📅 **{post['date']}**"
+            text += f"\n📝 **{post['post_title']}**"
+            text += f"\n🎥 **{post['video_count']} видео файлов**\n"
+            text += "─" * 40 + "\n"
+        
+        # Добавляем итоговую статистику
+        total_videos = sum(post['video_count'] for post in results['posts'])
+        text += f"\n📊 **ИТОГО:** {total_videos} видео в {len(results['posts'])} постах"
         
         return text
 
@@ -149,15 +168,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Команда /start от пользователя {update.effective_user.id}")
     
     keyboard = [
-        [InlineKeyboardButton("📊 Анализ 5 последних записей", callback_data='analyze_5')],
-        [InlineKeyboardButton("📊 Анализ 10 последних записей", callback_data='analyze_10')],
+        [InlineKeyboardButton("📊 Анализ за 5 дней", callback_data='analyze_5days')],
         [InlineKeyboardButton("🔄 Обновить данные", callback_data='refresh')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        "👋 Привет! Я бот для анализа видео в комментариях канала.\n"
-        "Выберите действие:",
+        f"👋 Привет! Я бот для анализа видео в канале @{CHANNEL_USERNAME}.\n"
+        f"Анализирую записи за последние 5 дней.\n"
+        f"Выберите действие:",
         reply_markup=reply_markup
     )
 
@@ -166,17 +185,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    if query.data == 'analyze_5':
-        await query.edit_message_text("🔍 Анализирую 5 последних записей... Подождите немного...")
-        results = await analyzer_bot.analyze_channel(5)
-        await query.edit_message_text(
-            analyzer_bot.format_results(results),
-            parse_mode='Markdown'
-        )
-    
-    elif query.data == 'analyze_10':
-        await query.edit_message_text("🔍 Анализирую 10 последних записей... Подождите немного...")
-        results = await analyzer_bot.analyze_channel(10)
+    if query.data == 'analyze_5days':
+        await query.edit_message_text("🔍 Анализирую записи за последние 5 дней... Подождите немного...")
+        results = await analyzer_bot.analyze_last_5_days()
         await query.edit_message_text(
             analyzer_bot.format_results(results),
             parse_mode='Markdown'
@@ -196,14 +207,8 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Команда /analyze от пользователя {update.effective_user.id}")
     
     try:
-        if context.args and context.args[0].isdigit():
-            count = min(int(context.args[0]), 20)
-            await update.message.reply_text(f"🔍 Анализирую {count} последних записей...")
-            results = await analyzer_bot.analyze_channel(count)
-        else:
-            await update.message.reply_text("🔍 Анализирую 5 последних записей...")
-            results = await analyzer_bot.analyze_channel(5)
-        
+        await update.message.reply_text("🔍 Анализирую записи за последние 5 дней...")
+        results = await analyzer_bot.analyze_last_5_days()
         await update.message.reply_text(
             analyzer_bot.format_results(results),
             parse_mode='Markdown'
