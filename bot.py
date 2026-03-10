@@ -25,11 +25,13 @@ CHANNEL_USERNAME = os.environ.get('CHANNEL_USERNAME')
 # Flask приложение для поддержания активности
 app = Flask(__name__)
 
-# Telethon клиент
-telethon_client = TelegramClient('bot_session', API_ID, API_HASH)
+# Глобальные переменные
+telethon_client = None
+analyzer_bot = None
 
 class VideoAnalyzerBot:
-    def __init__(self):
+    def __init__(self, client):
+        self.client = client
         self.stats_cache = {}
         self.last_analysis = None
         logger.info("🤖 Бот инициализирован")
@@ -40,15 +42,15 @@ class VideoAnalyzerBot:
             logger.info(f"🔍 Начинаю анализ {posts_count} последних записей...")
             
             # Проверяем подключение Telethon
-            if not telethon_client.is_connected():
-                await telethon_client.connect()
+            if not self.client.is_connected():
+                await self.client.connect()
             
-            channel = await telethon_client.get_entity(CHANNEL_USERNAME)
+            channel = await self.client.get_entity(CHANNEL_USERNAME)
             logger.info(f"📢 Канал найден: {channel.title}")
             
             # Получаем последние сообщения
             messages = []
-            async for message in telethon_client.iter_messages(channel, limit=posts_count):
+            async for message in self.client.iter_messages(channel, limit=posts_count):
                 messages.append(message)
             
             logger.info(f"📊 Найдено записей: {len(messages)}")
@@ -71,7 +73,7 @@ class VideoAnalyzerBot:
                 
                 try:
                     # Получаем комментарии к посту
-                    comments = await telethon_client.get_messages(
+                    comments = await self.client.get_messages(
                         channel,
                         limit=100,
                         reply_to=message.id
@@ -133,8 +135,14 @@ class VideoAnalyzerBot:
         
         return text
 
-# Создаем экземпляр бота
-analyzer_bot = VideoAnalyzerBot()
+# Flask маршруты
+@app.route('/')
+def home():
+    return "Bot is running! 🤖"
+
+@app.route('/health')
+def health():
+    return "OK", 200
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
@@ -204,59 +212,45 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка в команде analyze: {e}")
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
-# Flask маршруты
-@app.route('/')
-def home():
-    return "Bot is running! 🤖"
-
-@app.route('/health')
-def health():
-    return "OK", 200
-
-def run_bot():
-    """Запуск бота с правильным event loop"""
-    try:
-        # Создаем новый event loop для потока
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        # Создаем приложение бота
-        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        
-        # Добавляем обработчики
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("analyze", analyze_command))
-        application.add_handler(CallbackQueryHandler(button_handler))
-        
-        logger.info("🚀 Бот запущен и готов к работе")
-        
-        # Запускаем бота
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
-    except Exception as e:
-        logger.error(f"Ошибка при запуске бота: {e}")
-    finally:
-        loop.close()
-
-def init_telethon():
-    """Инициализация Telethon в правильном event loop"""
+def main():
+    """Главная функция"""
+    global telethon_client, analyzer_bot
+    
+    # Создаем event loop для главного потока
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
+    # Создаем Telethon клиент ПОСЛЕ создания event loop
+    telethon_client = TelegramClient('bot_session', API_ID, API_HASH)
+    analyzer_bot = VideoAnalyzerBot(telethon_client)
+    
+    # Запускаем Telethon
     async def start_telethon():
         await telethon_client.start()
         logger.info("✅ Telethon клиент подключен")
     
     loop.run_until_complete(start_telethon())
-    return loop
+    
+    # Создаем приложение бота в том же loop
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Добавляем обработчики
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("analyze", analyze_command))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    
+    logger.info("🚀 Бот запущен и готов к работе")
+    
+    # Запускаем Flask в отдельном потоке
+    def run_flask():
+        port = int(os.environ.get('PORT', 5000))
+        app.run(host='0.0.0.0', port=port, use_reloader=False)
+    
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
+    # Запускаем бота (это блокирующий вызов)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    # Сначала инициализируем Telethon
-    telethon_loop = init_telethon()
-    
-    # Запускаем бота в отдельном потоке
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-    
-    # Запускаем Flask
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    main()
