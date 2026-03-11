@@ -33,6 +33,7 @@ app = Flask(__name__)
 telethon_client = None
 analyzer_bot = None
 application_bot = None
+scheduler = None  # Планировщик
 
 class VideoAnalyzerBot:
     def __init__(self, client):
@@ -185,7 +186,7 @@ async def send_daily_report(chat_id=None):
     """Отправка ежедневного отчета"""
     global analyzer_bot, application_bot
     
-    logger.info("📊 Запуск ручного/автоматического отчета")
+    logger.info("📊 Запуск отчета")
     
     try:
         # Выполняем анализ за последние 5 дней
@@ -231,21 +232,19 @@ def health():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
-    logger.info(f"Команда /start от пользователя {update.effective_user.id}")
+    logger.info(f"✅ ПОЛУЧЕНА КОМАНДА /start от пользователя {update.effective_user.id}")
     
     keyboard = [
         [InlineKeyboardButton("📊 Анализ за 5 дней", callback_data='analyze_5days')],
         [InlineKeyboardButton("📅 Отчет за вчера", callback_data='run_daily_report')],
         [InlineKeyboardButton("🔄 Обновить данные", callback_data='refresh')],
-        [InlineKeyboardButton("📅 Проверить вчера", callback_data='check_yesterday')],
         [InlineKeyboardButton("🚪 Выход", callback_data='exit')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
         f"👋 Привет! Я бот для анализа видео в канале @{CHANNEL_USERNAME}.\n"
-        f"📅 Каждый день в 9 утра отправляю отчет о вчерашних тренировках.\n"
-        f"🔘 Нажми 'Отчет за вчера' для ручного запуска.\n\n"
+        f"📅 Каждый день в 9 утра отправляю отчет о вчерашних тренировках.\n\n"
         f"Выберите действие:",
         reply_markup=reply_markup
     )
@@ -254,6 +253,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик нажатий на кнопки"""
     query = update.callback_query
     await query.answer()
+    
+    logger.info(f"🔘 Нажата кнопка: {query.data}")
     
     if query.data == 'analyze_5days':
         await query.edit_message_text("🔍 Анализирую записи за последние 5 дней... Подождите немного...")
@@ -267,7 +268,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("📅 Формирую отчет за вчера... Подождите немного...")
         
         # Отправляем отчет в тот же чат, откуда пришел запрос
-        result = await send_daily_report(chat_id=update.effective_chat.id)
+        await send_daily_report(chat_id=update.effective_chat.id)
         
         # Удаляем сообщение "формирую отчет" и оставляем только результат
         await query.delete_message()
@@ -280,21 +281,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await query.edit_message_text("❌ Нет сохраненных данных. Сначала выполните анализ.")
-    
-    elif query.data == 'check_yesterday':
-        await query.edit_message_text("🔍 Проверяю вчерашние записи...")
-        results = await analyzer_bot.analyze_last_5_days()
-        has_posts, report_text = analyzer_bot.check_yesterday_posts(results)
-        
-        # Добавляем кнопку выхода
-        keyboard = [[InlineKeyboardButton("🚪 Выход", callback_data='exit')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            report_text,
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
     
     elif query.data == 'exit':
         # Удаляем сообщение или просто прощаемся
@@ -322,7 +308,7 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📅 Формирую отчет за вчера... Подождите немного...")
     
     # Отправляем отчет в тот же чат
-    result = await send_daily_report(chat_id=update.effective_chat.id)
+    await send_daily_report(chat_id=update.effective_chat.id)
 
 async def set_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Устанавливает ID текущего чата для отправки отчетов"""
@@ -331,7 +317,6 @@ async def set_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     TARGET_CHAT_ID = chat_id
     
-    # В реальном проекте сохраняйте в БД, здесь для простоты через переменную
     await update.message.reply_text(
         f"✅ ID чата установлен: {chat_id}\n"
         f"Теперь ежедневные отчеты будут приходить сюда."
@@ -339,6 +324,7 @@ async def set_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def setup_scheduler():
     """Настройка планировщика для ежедневных отчетов"""
+    global scheduler
     scheduler = BackgroundScheduler(timezone='Europe/Moscow')  # Московское время
     
     # Запуск каждый день в 9:00
@@ -353,9 +339,25 @@ def setup_scheduler():
     scheduler.start()
     logger.info("⏰ Планировщик запущен: ежедневный отчет в 9:00 (МСК)")
 
+def shutdown_scheduler():
+    """Остановка планировщика при завершении"""
+    global scheduler
+    if scheduler:
+        scheduler.shutdown(wait=False)
+        logger.info("⏰ Планировщик остановлен")
+
 def main():
     """Главная функция"""
     global telethon_client, analyzer_bot, application_bot
+    
+    logger.info("🚀 ЗАПУСК БОТА...")
+    
+    # Проверяем токен
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("❌ TELEGRAM_BOT_TOKEN не найден!")
+        return
+    
+    logger.info(f"✅ Токен загружен: {TELEGRAM_BOT_TOKEN[:10]}...")
     
     # Создаем event loop для главного потока
     loop = asyncio.new_event_loop()
@@ -382,6 +384,8 @@ def main():
     application_bot.add_handler(CommandHandler("setchat", set_chat_command))
     application_bot.add_handler(CallbackQueryHandler(button_handler))
     
+    logger.info("✅ Обработчики команд добавлены")
+    
     # Запускаем планировщик для ежедневных отчетов
     setup_scheduler()
     
@@ -394,9 +398,20 @@ def main():
     
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
+    logger.info(f"🌐 Flask сервер запущен на порту {os.environ.get('PORT', 5000)}")
     
-    # Запускаем бота
-    application_bot.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Запускаем бота (этот вызов блокирует поток)
+    try:
+        logger.info("🔄 Запускаю polling...")
+        application_bot.run_polling(allowed_updates=Update.ALL_TYPES)
+    except Exception as e:
+        logger.error(f"❌ Ошибка при запуске polling: {e}")
+    finally:
+        shutdown_scheduler()
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("👋 Бот остановлен пользователем")
+        shutdown_scheduler()
