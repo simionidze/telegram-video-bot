@@ -181,11 +181,11 @@ class VideoAnalyzerBot:
         
         return text
 
-async def send_daily_report():
-    """Отправка ежедневного отчета в 9 утра"""
+async def send_daily_report(chat_id=None):
+    """Отправка ежедневного отчета"""
     global analyzer_bot, application_bot
     
-    logger.info("⏰ Запуск ежедневного отчета в 9:00")
+    logger.info("📊 Запуск ручного/автоматического отчета")
     
     try:
         # Выполняем анализ за последние 5 дней
@@ -198,20 +198,27 @@ async def send_daily_report():
         keyboard = [[InlineKeyboardButton("🚪 Выход", callback_data='exit')]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        # Отправляем отчет в целевой чат
-        if TARGET_CHAT_ID:
+        # Определяем куда отправлять
+        target_chat = chat_id if chat_id else TARGET_CHAT_ID
+        
+        # Отправляем отчет
+        if target_chat:
             await application_bot.bot.send_message(
-                chat_id=TARGET_CHAT_ID,
+                chat_id=target_chat,
                 text=report_text,
                 parse_mode='Markdown',
                 reply_markup=reply_markup
             )
-            logger.info(f"✅ Отчет отправлен в чат {TARGET_CHAT_ID}")
+            logger.info(f"✅ Отчет отправлен в чат {target_chat}")
         else:
             logger.warning("⚠️ TARGET_CHAT_ID не указан, отчет не отправлен")
+            return "❌ Чат для отчетов не настроен. Используйте /setchat"
             
     except Exception as e:
-        logger.error(f"❌ Ошибка при отправке ежедневного отчета: {e}")
+        logger.error(f"❌ Ошибка при отправке отчета: {e}")
+        return f"❌ Ошибка: {e}"
+    
+    return report_text
 
 # Flask маршруты
 @app.route('/')
@@ -228,6 +235,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [InlineKeyboardButton("📊 Анализ за 5 дней", callback_data='analyze_5days')],
+        [InlineKeyboardButton("📅 Отчет за вчера", callback_data='run_daily_report')],
         [InlineKeyboardButton("🔄 Обновить данные", callback_data='refresh')],
         [InlineKeyboardButton("📅 Проверить вчера", callback_data='check_yesterday')],
         [InlineKeyboardButton("🚪 Выход", callback_data='exit')]
@@ -236,7 +244,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         f"👋 Привет! Я бот для анализа видео в канале @{CHANNEL_USERNAME}.\n"
-        f"📅 Каждый день в 9 утра отправляю отчет о вчерашних тренировках.\n\n"
+        f"📅 Каждый день в 9 утра отправляю отчет о вчерашних тренировках.\n"
+        f"🔘 Нажми 'Отчет за вчера' для ручного запуска.\n\n"
         f"Выберите действие:",
         reply_markup=reply_markup
     )
@@ -253,6 +262,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             analyzer_bot.format_results(results),
             parse_mode='Markdown'
         )
+    
+    elif query.data == 'run_daily_report':
+        await query.edit_message_text("📅 Формирую отчет за вчера... Подождите немного...")
+        
+        # Отправляем отчет в тот же чат, откуда пришел запрос
+        result = await send_daily_report(chat_id=update.effective_chat.id)
+        
+        # Удаляем сообщение "формирую отчет" и оставляем только результат
+        await query.delete_message()
     
     elif query.data == 'refresh':
         if analyzer_bot.last_analysis:
@@ -297,7 +315,16 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка в команде analyze: {e}")
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
-async def set_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /report для ручного запуска отчета"""
+    logger.info(f"Команда /report от пользователя {update.effective_user.id}")
+    
+    await update.message.reply_text("📅 Формирую отчет за вчера... Подождите немного...")
+    
+    # Отправляем отчет в тот же чат
+    result = await send_daily_report(chat_id=update.effective_chat.id)
+
+async def set_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Устанавливает ID текущего чата для отправки отчетов"""
     global TARGET_CHAT_ID
     
@@ -351,7 +378,8 @@ def main():
     # Добавляем обработчики
     application_bot.add_handler(CommandHandler("start", start))
     application_bot.add_handler(CommandHandler("analyze", analyze_command))
-    application_bot.add_handler(CommandHandler("setchat", set_chat_id))
+    application_bot.add_handler(CommandHandler("report", report_command))
+    application_bot.add_handler(CommandHandler("setchat", set_chat_command))
     application_bot.add_handler(CallbackQueryHandler(button_handler))
     
     # Запускаем планировщик для ежедневных отчетов
